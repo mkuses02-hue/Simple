@@ -26,6 +26,14 @@ OTP_KEYWORDS = (
     "one-time", "security code", "confirmation code", "login code"
 )
 
+# Pre-compiled regexes for maximum speed
+RE_OTP_KEYWORD = re.compile(
+    r"(?:verification|security|confirmation|login|one[- ]time|otp)"
+    r"(?:\s+code)?\s*[:#-]?\s*([0-9]{4,8})\b",
+    re.IGNORECASE
+)
+RE_OTP_FALLBACK = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+
 gmail_uid_watermark = 0
 bot_started_at = None
 telegram_loop = None
@@ -66,20 +74,14 @@ def get_text(msg):
 
 
 def extract_code(text):
-    m = re.search(
-        r"(?:verification|security|confirmation|login|one[- ]time|otp)"
-        r"(?:\s+code)?\s*[:#-]?\s*([0-9]{4,8})\b",
-        text, re.IGNORECASE
-    )
+    m = RE_OTP_KEYWORD.search(text)
     if m:
         return m.group(1)
-
-    m = re.search(r"(?<!\d)(\d{4,8})(?!\d)", text)
+    m = RE_OTP_FALLBACK.search(text)
     return m.group(1) if m else None
 
 
 def make_variation(text):
-    # Letters change case only. @, ., digits and punctuation stay unchanged.
     return "".join(
         c.upper() if c.isalpha() and random.getrandbits(1)
         else c.lower() if c.isalpha()
@@ -154,7 +156,7 @@ async def generate_variations_callback(
 def startup_uid():
     mail = None
     try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
         mail.login(GMAIL, APP_PASSWORD)
         mail.select("INBOX", readonly=True)
 
@@ -176,47 +178,35 @@ def startup_uid():
 def fetch_and_process_new(mail):
     global gmail_uid_watermark
 
-    status, data = mail.uid(
-        "search", None, f"UID {gmail_uid_watermark + 1}:*"
-    )
-
+    status, data = mail.uid("search", None, f"UID {gmail_uid_watermark + 1}:*")
     if status != "OK" or not data[0]:
         return []
 
     codes = []
+    uids = data[0].split()
 
-    for raw_uid in data[0].split():
+    for raw_uid in uids:
         uid = int(raw_uid)
-
         if uid <= gmail_uid_watermark:
             continue
 
         gmail_uid_watermark = max(gmail_uid_watermark, uid)
 
-        status, msg_data = mail.uid(
-            "fetch", raw_uid, "(RFC822)"
-        )
-
+        # Optimization: Fetch BODY.PEEK[] instead of RFC822 to avoid pulling attachments
+        status, msg_data = mail.uid("fetch", raw_uid, "(BODY.PEEK[])")
         if status != "OK":
             continue
 
-        raw = next(
-            (x[1] for x in msg_data if isinstance(x, tuple)),
-            None
-        )
-
+        raw = next((x[1] for x in msg_data if isinstance(x, tuple)), None)
         if not raw:
             continue
 
         msg = email.message_from_bytes(raw)
         subject = decode_header_value(msg.get("Subject", ""))
         body = get_text(msg)
-        combined = subject + "\n" + body
+        combined = f"{subject}\n{body}"
 
-        if not any(
-            k.lower() in combined.lower()
-            for k in OTP_KEYWORDS
-        ):
+        if not any(k in combined.lower() for k in OTP_KEYWORDS):
             continue
 
         code = extract_code(combined)
@@ -228,20 +218,13 @@ def fetch_and_process_new(mail):
 
 def schedule_telegram_code(code):
     if telegram_loop and not telegram_loop.is_closed():
-        asyncio.run_coroutine_threadsafe(
-            send_telegram_code(code),
-            telegram_loop
-        )
+        asyncio.run_coroutine_threadsafe(send_telegram_code(code), telegram_loop)
 
 
 async def send_telegram_code(code):
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "📋 Copy",
-            copy_text={"text": code}
-        )
+        InlineKeyboardButton("📋 Copy", copy_text={"text": code})
     ]])
-
     await application.bot.send_message(
         chat_id=CHAT_ID,
         text=f"Code: {code}",
@@ -250,111 +233,75 @@ async def send_telegram_code(code):
 
 
 def gmail_idle_worker():
-    """
-    Dedicated thread.
-    Uses raw socket select() while Gmail IMAP IDLE is active.
-    No polling delay and no blocking of Telegram's event loop.
-    """
     global gmail_uid_watermark
 
     while True:
         mail = None
-
         try:
-            mail = imaplib.IMAP4_SSL(
-                "imap.gmail.com",
-                timeout=20
-            )
-
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
             mail.login(GMAIL, APP_PASSWORD)
             mail.select("INBOX", readonly=True)
 
-            print(
-                "Gmail IMAP connected — IDLE active",
-                flush=True
-            )
+            print("Gmail IMAP connected — IDLE active", flush=True)
 
             while True:
-                # Catch anything that arrived since the previous cycle.
+                # Process any pending mail immediately
                 for code in fetch_and_process_new(mail):
                     schedule_telegram_code(code)
 
-                # Enter IMAP IDLE.
+                # Enter IMAP IDLE
                 tag = mail._new_tag()
                 mail.send(tag + b" IDLE\r\n")
 
-                # Wait for the server's continuation response.
+                # Wait for continuation response '+'
                 response = mail.readline()
+                if not response or not response.startswith(b"+"):
+                    raise ConnectionError("IDLE response error")
 
-                if not response:
-                    raise ConnectionError("IDLE continuation missing")
-
-                # Gmail recommends refreshing IDLE periodically.
                 idle_until = time.monotonic() + 25 * 60
 
                 while time.monotonic() < idle_until:
-
-                    # select() wakes as soon as Gmail sends an EXISTS event.
-                    ready, _, _ = select.select(
-                        [mail.sock],
-                        [],
-                        [],
-                        30
-                    )
+                    # Check internal socket buffer first before calling select()
+                    if hasattr(mail, '_file') and mail._file and mail._file.peek():
+                        ready = True
+                    else:
+                        r, _, _ = select.select([mail.sock], [], [], 15)
+                        ready = bool(r)
 
                     if not ready:
-                        # No event for 30 seconds. Stay in IDLE.
                         continue
 
                     line = mail.readline()
-
                     if not line:
-                        raise ConnectionError(
-                            "IMAP socket closed"
-                        )
+                        raise ConnectionError("IMAP socket closed")
 
-                    # New message notification.
                     if b" EXISTS" in line or b" RECENT" in line:
-
-                        # Exit IDLE immediately.
+                        # Exit IDLE immediately
                         mail.send(b"DONE\r\n")
-
-                        # Read until tagged completion.
+                        
+                        # Read until command completion
                         while True:
                             done_line = mail.readline()
-                            if not done_line:
-                                raise ConnectionError(
-                                    "IMAP DONE response missing"
-                                )
-                            if done_line.startswith(tag):
+                            if not done_line or done_line.startswith(tag):
                                 break
 
-                        # Gmail has already told us the mailbox changed.
-                        # Fetch immediately; no sleep/polling.
+                        # Fetch new messages instantly
                         for code in fetch_and_process_new(mail):
                             schedule_telegram_code(code)
 
-                        break
+                        break  # Re-enter outer IDLE loop
 
                 else:
-                    # Refresh IDLE before server timeout.
+                    # Refresh IDLE session before 25-min server drop
                     mail.send(b"DONE\r\n")
-
                     while True:
                         done_line = mail.readline()
-                        if not done_line:
-                            raise ConnectionError(
-                                "IMAP refresh response missing"
-                            )
-                        if done_line.startswith(tag):
+                        if not done_line or done_line.startswith(tag):
                             break
 
         except Exception as e:
-            print(
-                f"Gmail connection lost: {e}. Reconnecting...",
-                flush=True
-            )
-            time.sleep(0.5)
+            print(f"Gmail connection lost: {e}. Reconnecting...", flush=True)
+            time.sleep(1)
 
         finally:
             if mail:
@@ -365,27 +312,15 @@ def gmail_idle_worker():
 
 
 async def post_init(app):
-    global bot_started_at
-    global gmail_uid_watermark
-    global telegram_loop
+    global bot_started_at, gmail_uid_watermark, telegram_loop
 
-    # Remove Telegram updates that accumulated while offline.
-    await app.bot.delete_webhook(
-        drop_pending_updates=True
-    )
-
-    # IMPORTANT: baseline existing Gmail mail before starting worker.
-    gmail_uid_watermark = await asyncio.to_thread(
-        startup_uid
-    )
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    gmail_uid_watermark = await asyncio.to_thread(startup_uid)
 
     bot_started_at = datetime.now(timezone.utc)
     telegram_loop = asyncio.get_running_loop()
 
-    print(
-        f"READY | Gmail UID baseline: {gmail_uid_watermark}",
-        flush=True
-    )
+    print(f"READY | Gmail UID baseline: {gmail_uid_watermark}", flush=True)
 
     threading.Thread(
         target=gmail_idle_worker,
@@ -404,10 +339,7 @@ def main():
         .build()
     )
 
-    application.add_handler(
-        CommandHandler("start", start_command)
-    )
-
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(
         CallbackQueryHandler(
             generate_variations_callback,
@@ -415,14 +347,8 @@ def main():
         )
     )
 
-    print(
-        "Telegram bot starting...",
-        flush=True
-    )
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+    print("Telegram bot starting...", flush=True)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
