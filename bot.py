@@ -15,8 +15,6 @@ GMAIL = os.environ["GMAIL"]
 APP_PASSWORD = os.environ["APP_PASSWORD"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 
-# Example:
-# BASE_TEXT=AsocksAvi01@gmail.com
 BASE_TEXT = os.environ.get("BASE_TEXT", "YourTextHere")
 VARIATION_COUNT = int(os.environ.get("VARIATION_COUNT", "10"))
 
@@ -25,7 +23,9 @@ OTP_KEYWORDS = (
     "one-time", "security code", "confirmation code", "login code"
 )
 
-seen_uids = set()
+# Gmail UID watermark. Messages at or below this UID existed when the
+# bot started and are NEVER forwarded by this process.
+uid_watermark = 0
 bot_started_at = None
 
 
@@ -43,28 +43,22 @@ def decode_header_value(value):
 
 def get_text(msg):
     chunks = []
-
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/plain":
                 payload = part.get_payload(decode=True)
                 if payload:
-                    chunks.append(
-                        payload.decode(
-                            part.get_content_charset() or "utf-8",
-                            errors="ignore"
-                        )
-                    )
+                    chunks.append(payload.decode(
+                        part.get_content_charset() or "utf-8",
+                        errors="ignore"
+                    ))
     else:
         payload = msg.get_payload(decode=True)
         if payload:
-            chunks.append(
-                payload.decode(
-                    msg.get_content_charset() or "utf-8",
-                    errors="ignore"
-                )
-            )
-
+            chunks.append(payload.decode(
+                msg.get_content_charset() or "utf-8",
+                errors="ignore"
+            ))
     return "\n".join(chunks)
 
 
@@ -72,10 +66,8 @@ def extract_code(text):
     labelled = re.search(
         r"(?:verification|security|confirmation|login|one[- ]time|otp)"
         r"(?:\s+code)?\s*[:#-]?\s*([0-9]{4,8})\b",
-        text,
-        re.IGNORECASE
+        text, re.IGNORECASE
     )
-
     if labelled:
         return labelled.group(1)
 
@@ -83,40 +75,26 @@ def extract_code(text):
     return match.group(1) if match else None
 
 
-# IMPORTANT:
-# Only alphabetic characters change case.
-# Digits, dots, @, spaces, hyphens, etc. NEVER change.
-def make_text_variation(text):
-    output = []
-
-    for char in text:
-        if char.isalpha():
-            output.append(
-                char.upper()
-                if random.getrandbits(1)
-                else char.lower()
-            )
-        else:
-            output.append(char)
-
-    return "".join(output)
+def make_variation(text):
+    # Only letters change. @, ., digits and every other character stay intact.
+    return "".join(
+        c.upper() if c.isalpha() and random.getrandbits(1)
+        else c.lower() if c.isalpha()
+        else c
+        for c in text
+    )
 
 
 def create_variations(text, count):
-    variations = []
-    seen = set()
+    result, seen = [], set()
     attempts = 0
-
-    while len(variations) < count and attempts < count * 100:
-        variation = make_text_variation(text)
-
-        if variation not in seen:
-            seen.add(variation)
-            variations.append(variation)
-
+    while len(result) < count and attempts < count * 100:
+        v = make_variation(text)
+        if v not in seen:
+            seen.add(v)
+            result.append(v)
         attempts += 1
-
-    return variations
+    return result
 
 
 def is_new_update(update):
@@ -124,36 +102,26 @@ def is_new_update(update):
         return False
 
     message = update.effective_message
-
     if not message or not message.date:
         return False
 
     message_date = message.date
-
     if message_date.tzinfo is None:
         message_date = message_date.replace(tzinfo=timezone.utc)
 
     return message_date >= bot_started_at
 
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if update.effective_chat.id != CHAT_ID:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != CHAT_ID or not is_new_update(update):
         return
 
-    if not is_new_update(update):
-        return
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🔤 Generate Variations",
-                callback_data="generate_variations"
-            )
-        ]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🔤 Generate Variations",
+            callback_data="generate_variations"
+        )
+    ]])
 
     await update.message.reply_text(
         "🤖 Gmail Bot\n\nChoose an option:",
@@ -161,120 +129,107 @@ async def start_command(
     )
 
 
-async def generate_variations_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def generate_variations_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-
     if query.message.chat_id != CHAT_ID:
         await query.answer()
         return
 
     await query.answer("Generating...")
 
-    variations = create_variations(
-        BASE_TEXT,
-        VARIATION_COUNT
-    )
-
-    # One variation per line.
-    # Backticks only format the text; there are no individual buttons.
-    lines = []
-
-    for variation in variations:
-        safe = variation.replace("`", "")
-        lines.append(f"`{safe}`")
-
-    await query.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown"
-    )
+    lines = [
+        f"`{v.replace('`', '')}`"
+        for v in create_variations(BASE_TEXT, VARIATION_COUNT)
+    ]
+    await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-def gmail_check_sync():
+def get_current_uid_watermark():
+    """Return the newest UID currently in INBOX."""
     mail = None
-
     try:
-        mail = imaplib.IMAP4_SSL(
-            "imap.gmail.com",
-            timeout=12
-        )
-
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=12)
         mail.login(GMAIL, APP_PASSWORD)
         mail.select("INBOX", readonly=True)
 
-        status, data = mail.uid(
-            "search",
-            None,
-            "UNSEEN"
-        )
+        status, data = mail.uid("search", None, "ALL")
+        if status != "OK" or not data[0]:
+            return 0
 
+        return int(data[0].split()[-1])
+    except Exception as exc:
+        print(f"Initial Gmail watermark error: {exc}", flush=True)
+        return 0
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
+def gmail_check_sync():
+    """Process only Gmail UIDs newer than the startup watermark."""
+    global uid_watermark
+    mail = None
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=12)
+        mail.login(GMAIL, APP_PASSWORD)
+        mail.select("INBOX", readonly=True)
+
+        # UID search is used instead of UNSEEN. This means an old unread
+        # message can never be sent just because it remains unread.
+        status, data = mail.uid(
+            "search", None, f"UID {uid_watermark + 1}:*"
+        )
         if status != "OK":
             return []
 
         codes = []
 
         for raw_uid in data[0].split():
-
             uid = int(raw_uid)
 
-            if uid in seen_uids:
+            if uid <= uid_watermark:
                 continue
 
-            seen_uids.add(uid)
+            # Advance watermark even if this message is not an OTP.
+            uid_watermark = max(uid_watermark, uid)
 
             status, msg_data = mail.uid(
-                "fetch",
-                raw_uid,
-                "(RFC822)"
+                "fetch", raw_uid, "(RFC822)"
             )
-
             if status != "OK" or not msg_data:
                 continue
 
             raw = next(
-                (
-                    item[1]
-                    for item in msg_data
-                    if isinstance(item, tuple)
-                ),
+                (item[1] for item in msg_data if isinstance(item, tuple)),
                 None
             )
-
             if not raw:
                 continue
 
             msg = email.message_from_bytes(raw)
-
-            subject = decode_header_value(
-                msg.get("Subject", "")
-            )
-
+            subject = decode_header_value(msg.get("Subject", ""))
             body = get_text(msg)
-
             combined = f"{subject}\n{body}"
 
             if not any(
-                keyword.lower() in combined.lower()
-                for keyword in OTP_KEYWORDS
+                k.lower() in combined.lower()
+                for k in OTP_KEYWORDS
             ):
                 continue
 
             code = extract_code(combined)
-
             if code:
                 codes.append(code)
 
         return codes
 
     except Exception as exc:
-        print(
-            f"Gmail error: {exc}",
-            flush=True
-        )
+        print(f"Gmail error: {exc}", flush=True)
         return []
-
     finally:
         if mail:
             try:
@@ -285,22 +240,16 @@ def gmail_check_sync():
 
 async def otp_worker(app):
     while True:
-
         try:
-            codes = await asyncio.to_thread(
-                gmail_check_sync
-            )
+            codes = await asyncio.to_thread(gmail_check_sync)
 
             for code in codes:
-
-                keyboard = InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "📋 Copy",
-                            copy_text={"text": code}
-                        )
-                    ]
-                ])
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "📋 Copy",
+                        copy_text={"text": code}
+                    )
+                ]])
 
                 await app.bot.send_message(
                     chat_id=CHAT_ID,
@@ -309,39 +258,33 @@ async def otp_worker(app):
                 )
 
         except Exception as exc:
-            print(
-                f"OTP worker error: {exc}",
-                flush=True
-            )
+            print(f"OTP worker error: {exc}", flush=True)
 
-        # Gmail checker is independent from Telegram polling.
         await asyncio.sleep(2)
 
 
 async def post_init(app):
+    global bot_started_at, uid_watermark
 
-    global bot_started_at
+    # Drop old Telegram updates first.
+    await app.bot.delete_webhook(drop_pending_updates=True)
 
-    # Remove updates that accumulated while the bot was offline.
-    await app.bot.delete_webhook(
-        drop_pending_updates=True
-    )
+    # IMPORTANT: establish the Gmail UID baseline BEFORE starting the worker.
+    # Therefore all messages already in the inbox are ignored.
+    uid_watermark = await asyncio.to_thread(get_current_uid_watermark)
 
-    # Only messages received after this moment are accepted.
     bot_started_at = datetime.now(timezone.utc)
 
-    app.create_task(
-        otp_worker(app)
-    )
-
     print(
-        f"Bot ready: {bot_started_at.isoformat()}",
+        f"Bot ready. Gmail UID watermark={uid_watermark}. "
+        f"Telegram cutoff={bot_started_at.isoformat()}",
         flush=True
     )
 
+    app.create_task(otp_worker(app))
+
 
 def main():
-
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -349,13 +292,7 @@ def main():
         .build()
     )
 
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start_command
-        )
-    )
-
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(
         CallbackQueryHandler(
             generate_variations_callback,
@@ -363,14 +300,8 @@ def main():
         )
     )
 
-    print(
-        "Telegram bot starting...",
-        flush=True
-    )
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+    print("Telegram bot starting...", flush=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
