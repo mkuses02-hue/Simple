@@ -1,11 +1,11 @@
 import os
 import imaplib
-import email
 import re
 import asyncio
 import random
 import threading
 import select
+import socket
 import time
 from datetime import datetime, timezone
 from email.header import decode_header
@@ -26,7 +26,7 @@ OTP_KEYWORDS = (
     "one-time", "security code", "confirmation code", "login code"
 )
 
-# Pre-compiled regexes for maximum speed
+# Pre-compiled fast regexes
 RE_OTP_KEYWORD = re.compile(
     r"(?:verification|security|confirmation|login|one[- ]time|otp)"
     r"(?:\s+code)?\s*[:#-]?\s*([0-9]{4,8})\b",
@@ -50,27 +50,6 @@ def decode_header_value(value):
         else:
             out.append(part)
     return "".join(out)
-
-
-def get_text(msg):
-    chunks = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    chunks.append(payload.decode(
-                        part.get_content_charset() or "utf-8",
-                        errors="ignore"
-                    ))
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            chunks.append(payload.decode(
-                msg.get_content_charset() or "utf-8",
-                errors="ignore"
-            ))
-    return "\n".join(chunks)
 
 
 def extract_code(text):
@@ -119,38 +98,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            "🔤 Generate Variations",
-            callback_data="generate_variations"
-        )
+        InlineKeyboardButton("🔤 Generate Variations", callback_data="generate_variations")
     ]])
 
-    await update.message.reply_text(
-        "🤖 Gmail Bot\n\nChoose an option:",
-        reply_markup=keyboard
-    )
+    await update.message.reply_text("🤖 Gmail Bot\n\nChoose an option:", reply_markup=keyboard)
 
 
-async def generate_variations_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def generate_variations_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.message.chat_id != CHAT_ID:
         await q.answer()
         return
 
     await q.answer()
-
-    lines = [
-        f"`{v.replace('`', '')}`"
-        for v in create_variations(BASE_TEXT, VARIATION_COUNT)
-    ]
-
-    await q.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown"
-    )
+    lines = [f"`{v.replace('`', '')}`" for v in create_variations(BASE_TEXT, VARIATION_COUNT)]
+    await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 def startup_uid():
@@ -182,36 +144,54 @@ def fetch_and_process_new(mail):
     if status != "OK" or not data[0]:
         return []
 
+    uids = [int(u) for u in data[0].split() if int(u) > gmail_uid_watermark]
+    if not uids:
+        return []
+
+    gmail_uid_watermark = max(uids)
+
+    # Optimization: Batch fetch Subject & Text for ALL new UIDs in a SINGLE IMAP roundtrip
+    uid_batch_str = ",".join(str(u) for u in uids)
+    status, msg_data = mail.uid(
+        "fetch", 
+        uid_batch_str, 
+        "(BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])"
+    )
+    if status != "OK":
+        return []
+
     codes = []
-    uids = data[0].split()
+    
+    # Process batch response rapidly
+    current_text_block = []
+    for item in msg_data:
+        if isinstance(item, tuple):
+            try:
+                chunk = item[1].decode("utf-8", errors="ignore")
+                current_text_block.append(chunk)
+            except Exception:
+                continue
+        elif item == b')' or item == b'':
+            if current_text_block:
+                full_raw_text = "\n".join(current_text_block)
+                current_text_block.clear()
 
-    for raw_uid in uids:
-        uid = int(raw_uid)
-        if uid <= gmail_uid_watermark:
-            continue
+                # Fast Keyword Filter
+                if not any(k in full_raw_text.lower() for k in OTP_KEYWORDS):
+                    continue
 
-        gmail_uid_watermark = max(gmail_uid_watermark, uid)
+                # Extract Code
+                code = extract_code(full_raw_text)
+                if code:
+                    codes.append(code)
 
-        # Optimization: Fetch BODY.PEEK[] instead of RFC822 to avoid pulling attachments
-        status, msg_data = mail.uid("fetch", raw_uid, "(BODY.PEEK[])")
-        if status != "OK":
-            continue
-
-        raw = next((x[1] for x in msg_data if isinstance(x, tuple)), None)
-        if not raw:
-            continue
-
-        msg = email.message_from_bytes(raw)
-        subject = decode_header_value(msg.get("Subject", ""))
-        body = get_text(msg)
-        combined = f"{subject}\n{body}"
-
-        if not any(k in combined.lower() for k in OTP_KEYWORDS):
-            continue
-
-        code = extract_code(combined)
-        if code:
-            codes.append(code)
+    # Residual cleanup if data trailing
+    if current_text_block:
+        full_raw_text = "\n".join(current_text_block)
+        if any(k in full_raw_text.lower() for k in OTP_KEYWORDS):
+            code = extract_code(full_raw_text)
+            if code:
+                codes.append(code)
 
     return codes
 
@@ -239,10 +219,14 @@ def gmail_idle_worker():
         mail = None
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
+            
+            # Disable Nagle's algorithm for immediate packet flushing
+            mail.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
             mail.login(GMAIL, APP_PASSWORD)
             mail.select("INBOX", readonly=True)
 
-            print("Gmail IMAP connected — IDLE active", flush=True)
+            print("Gmail IMAP connected (TCP_NODELAY active) — IDLE active", flush=True)
 
             while True:
                 # Process any pending mail immediately
@@ -253,7 +237,7 @@ def gmail_idle_worker():
                 tag = mail._new_tag()
                 mail.send(tag + b" IDLE\r\n")
 
-                # Wait for continuation response '+'
+                # Read continuation '+'
                 response = mail.readline()
                 if not response or not response.startswith(b"+"):
                     raise ConnectionError("IDLE response error")
@@ -261,11 +245,11 @@ def gmail_idle_worker():
                 idle_until = time.monotonic() + 25 * 60
 
                 while time.monotonic() < idle_until:
-                    # Check internal socket buffer first before calling select()
+                    # Instant check on internal Python buffer
                     if hasattr(mail, '_file') and mail._file and mail._file.peek():
                         ready = True
                     else:
-                        r, _, _ = select.select([mail.sock], [], [], 15)
+                        r, _, _ = select.select([mail.sock], [], [], 10)
                         ready = bool(r)
 
                     if not ready:
@@ -276,23 +260,22 @@ def gmail_idle_worker():
                         raise ConnectionError("IMAP socket closed")
 
                     if b" EXISTS" in line or b" RECENT" in line:
-                        # Exit IDLE immediately
+                        # Exit IDLE instantly
                         mail.send(b"DONE\r\n")
                         
-                        # Read until command completion
                         while True:
                             done_line = mail.readline()
                             if not done_line or done_line.startswith(tag):
                                 break
 
-                        # Fetch new messages instantly
+                        # Instantly batch-fetch and process new code(s)
                         for code in fetch_and_process_new(mail):
                             schedule_telegram_code(code)
 
-                        break  # Re-enter outer IDLE loop
+                        break  # Resume IDLE loop
 
                 else:
-                    # Refresh IDLE session before 25-min server drop
+                    # Send DONE before 25-min server timeout
                     mail.send(b"DONE\r\n")
                     while True:
                         done_line = mail.readline()
@@ -300,8 +283,8 @@ def gmail_idle_worker():
                             break
 
         except Exception as e:
-            print(f"Gmail connection lost: {e}. Reconnecting...", flush=True)
-            time.sleep(1)
+            print(f"Gmail connection error: {e}. Reconnecting...", flush=True)
+            time.sleep(0.5)
 
         finally:
             if mail:
