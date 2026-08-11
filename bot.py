@@ -26,7 +26,7 @@ OTP_KEYWORDS = (
     "one-time", "security code", "confirmation code", "login code"
 )
 
-# Pre-compiled fast regexes
+# Ultra-fast pre-compiled regexes
 RE_OTP_KEYWORD = re.compile(
     r"(?:verification|security|confirmation|login|one[- ]time|otp)"
     r"(?:\s+code)?\s*[:#-]?\s*([0-9]{4,8})\b",
@@ -149,49 +149,53 @@ def fetch_and_process_new(mail):
         return []
 
     gmail_uid_watermark = max(uids)
-
-    # Optimization: Batch fetch Subject & Text for ALL new UIDs in a SINGLE IMAP roundtrip
     uid_batch_str = ",".join(str(u) for u in uids)
-    status, msg_data = mail.uid(
-        "fetch", 
-        uid_batch_str, 
-        "(BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])"
-    )
+
+    # STEP 1: Ultra-fast batch fetch of Subjects only
+    status, msg_data = mail.uid("fetch", uid_batch_str, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
     if status != "OK":
         return []
 
     codes = []
-    
-    # Process batch response rapidly
-    current_text_block = []
+    unresolved_uids = []
+
     for item in msg_data:
         if isinstance(item, tuple):
             try:
-                chunk = item[1].decode("utf-8", errors="ignore")
-                current_text_block.append(chunk)
+                raw_header = item[1].decode("utf-8", errors="ignore")
+                subject = decode_header_value(raw_header)
+                
+                # Fast check in subject line
+                if any(k in subject.lower() for k in OTP_KEYWORDS):
+                    code = extract_code(subject)
+                    if code:
+                        codes.append(code)
+                        continue
+                
+                # If subject didn't yield a code, we flag this UID for body fetch
+                # Extract UID from the IMAP response tuple metadata string if possible, 
+                # or fallback to resolving via batch index.
+                match = re.search(r"UID\s+(\d+)", item[0].decode("utf-8", errors="ignore"))
+                if match:
+                    unresolved_uids.append(match.group(1))
             except Exception:
                 continue
-        elif item == b')' or item == b'':
-            if current_text_block:
-                full_raw_text = "\n".join(current_text_block)
-                current_text_block.clear()
 
-                # Fast Keyword Filter
-                if not any(k in full_raw_text.lower() for k in OTP_KEYWORDS):
-                    continue
-
-                # Extract Code
-                code = extract_code(full_raw_text)
-                if code:
-                    codes.append(code)
-
-    # Residual cleanup if data trailing
-    if current_text_block:
-        full_raw_text = "\n".join(current_text_block)
-        if any(k in full_raw_text.lower() for k in OTP_KEYWORDS):
-            code = extract_code(full_raw_text)
-            if code:
-                codes.append(code)
+    # STEP 2: Fetch Text body ONLY for emails where the subject wasn't enough
+    if unresolved_uids:
+        body_batch_str = ",".join(unresolved_uids)
+        status, body_data = mail.uid("fetch", body_batch_str, "(BODY.PEEK[TEXT])")
+        if status == "OK":
+            for item in body_data:
+                if isinstance(item, tuple):
+                    try:
+                        body_text = item[1].decode("utf-8", errors="ignore")
+                        if any(k in body_text.lower() for k in OTP_KEYWORDS):
+                            code = extract_code(body_text)
+                            if code:
+                                codes.append(code)
+                    except Exception:
+                        continue
 
     return codes
 
@@ -219,25 +223,20 @@ def gmail_idle_worker():
         mail = None
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
-            
-            # Disable Nagle's algorithm for immediate packet flushing
             mail.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
             mail.login(GMAIL, APP_PASSWORD)
             mail.select("INBOX", readonly=True)
 
-            print("Gmail IMAP connected (TCP_NODELAY active) — IDLE active", flush=True)
+            print("Gmail IMAP connected (Max-Speed Mode) — IDLE active", flush=True)
 
             while True:
-                # Process any pending mail immediately
                 for code in fetch_and_process_new(mail):
                     schedule_telegram_code(code)
 
-                # Enter IMAP IDLE
                 tag = mail._new_tag()
                 mail.send(tag + b" IDLE\r\n")
 
-                # Read continuation '+'
                 response = mail.readline()
                 if not response or not response.startswith(b"+"):
                     raise ConnectionError("IDLE response error")
@@ -245,11 +244,11 @@ def gmail_idle_worker():
                 idle_until = time.monotonic() + 25 * 60
 
                 while time.monotonic() < idle_until:
-                    # Instant check on internal Python buffer
                     if hasattr(mail, '_file') and mail._file and mail._file.peek():
                         ready = True
                     else:
-                        r, _, _ = select.select([mail.sock], [], [], 10)
+                        # 2-second timeout for lightning-fast polling loop response
+                        r, _, _ = select.select([mail.sock], [], [], 2.0)
                         ready = bool(r)
 
                     if not ready:
@@ -260,7 +259,6 @@ def gmail_idle_worker():
                         raise ConnectionError("IMAP socket closed")
 
                     if b" EXISTS" in line or b" RECENT" in line:
-                        # Exit IDLE instantly
                         mail.send(b"DONE\r\n")
                         
                         while True:
@@ -268,14 +266,12 @@ def gmail_idle_worker():
                             if not done_line or done_line.startswith(tag):
                                 break
 
-                        # Instantly batch-fetch and process new code(s)
                         for code in fetch_and_process_new(mail):
                             schedule_telegram_code(code)
 
-                        break  # Resume IDLE loop
+                        break
 
                 else:
-                    # Send DONE before 25-min server timeout
                     mail.send(b"DONE\r\n")
                     while True:
                         done_line = mail.readline()
