@@ -4,6 +4,8 @@ import email
 import re
 import asyncio
 import random
+import threading
+import time
 from datetime import datetime, timezone
 from email.header import decode_header
 
@@ -23,22 +25,21 @@ OTP_KEYWORDS = (
     "one-time", "security code", "confirmation code", "login code"
 )
 
-# Gmail UID watermark. Messages at or below this UID existed when the
-# bot started and are NEVER forwarded by this process.
-uid_watermark = 0
 bot_started_at = None
+gmail_uid_watermark = 0
+telegram_loop = None
 
 
 def decode_header_value(value):
     if not value:
         return ""
-    result = []
+    out = []
     for part, enc in decode_header(value):
         if isinstance(part, bytes):
-            result.append(part.decode(enc or "utf-8", errors="ignore"))
+            out.append(part.decode(enc or "utf-8", errors="ignore"))
         else:
-            result.append(part)
-    return "".join(result)
+            out.append(part)
+    return "".join(out)
 
 
 def get_text(msg):
@@ -63,20 +64,22 @@ def get_text(msg):
 
 
 def extract_code(text):
-    labelled = re.search(
+    # Prefer a code associated with an OTP/verification label.
+    m = re.search(
         r"(?:verification|security|confirmation|login|one[- ]time|otp)"
         r"(?:\s+code)?\s*[:#-]?\s*([0-9]{4,8})\b",
-        text, re.IGNORECASE
+        text,
+        re.IGNORECASE
     )
-    if labelled:
-        return labelled.group(1)
+    if m:
+        return m.group(1)
 
-    match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", text)
-    return match.group(1) if match else None
+    m = re.search(r"(?<!\d)(\d{4,8})(?!\d)", text)
+    return m.group(1) if m else None
 
 
 def make_variation(text):
-    # Only letters change. @, ., digits and every other character stay intact.
+    # Only letters change. @, ., digits and punctuation stay unchanged.
     return "".join(
         c.upper() if c.isalpha() and random.getrandbits(1)
         else c.lower() if c.isalpha()
@@ -100,16 +103,13 @@ def create_variations(text, count):
 def is_new_update(update):
     if bot_started_at is None:
         return False
-
     message = update.effective_message
     if not message or not message.date:
         return False
-
-    message_date = message.date
-    if message_date.tzinfo is None:
-        message_date = message_date.replace(tzinfo=timezone.utc)
-
-    return message_date >= bot_started_at
+    d = message.date
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d >= bot_started_at
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,8 +135,7 @@ async def generate_variations_callback(update: Update, context: ContextTypes.DEF
         await query.answer()
         return
 
-    await query.answer("Generating...")
-
+    await query.answer()
     lines = [
         f"`{v.replace('`', '')}`"
         for v in create_variations(BASE_TEXT, VARIATION_COUNT)
@@ -144,21 +143,18 @@ async def generate_variations_callback(update: Update, context: ContextTypes.DEF
     await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-def get_current_uid_watermark():
-    """Return the newest UID currently in INBOX."""
+def get_startup_uid():
     mail = None
     try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=12)
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
         mail.login(GMAIL, APP_PASSWORD)
         mail.select("INBOX", readonly=True)
-
         status, data = mail.uid("search", None, "ALL")
-        if status != "OK" or not data[0]:
-            return 0
-
-        return int(data[0].split()[-1])
+        if status == "OK" and data[0]:
+            return int(data[0].split()[-1])
+        return 0
     except Exception as exc:
-        print(f"Initial Gmail watermark error: {exc}", flush=True)
+        print(f"Startup Gmail UID error: {exc}", flush=True)
         return 0
     finally:
         if mail:
@@ -168,132 +164,208 @@ def get_current_uid_watermark():
                 pass
 
 
-def gmail_check_sync():
-    """Process only Gmail UIDs newer than the startup watermark."""
-    global uid_watermark
-    mail = None
+def fetch_uid(mail, uid):
+    status, data = mail.uid("fetch", str(uid), "(RFC822)")
+    if status != "OK" or not data:
+        return None
 
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=12)
-        mail.login(GMAIL, APP_PASSWORD)
-        mail.select("INBOX", readonly=True)
+    raw = next(
+        (item[1] for item in data if isinstance(item, tuple)),
+        None
+    )
+    if not raw:
+        return None
 
-        # UID search is used instead of UNSEEN. This means an old unread
-        # message can never be sent just because it remains unread.
-        status, data = mail.uid(
-            "search", None, f"UID {uid_watermark + 1}:*"
-        )
-        if status != "OK":
-            return []
+    return email.message_from_bytes(raw)
 
-        codes = []
 
-        for raw_uid in data[0].split():
-            uid = int(raw_uid)
+def process_new_uids(mail):
+    global gmail_uid_watermark
 
-            if uid <= uid_watermark:
-                continue
-
-            # Advance watermark even if this message is not an OTP.
-            uid_watermark = max(uid_watermark, uid)
-
-            status, msg_data = mail.uid(
-                "fetch", raw_uid, "(RFC822)"
-            )
-            if status != "OK" or not msg_data:
-                continue
-
-            raw = next(
-                (item[1] for item in msg_data if isinstance(item, tuple)),
-                None
-            )
-            if not raw:
-                continue
-
-            msg = email.message_from_bytes(raw)
-            subject = decode_header_value(msg.get("Subject", ""))
-            body = get_text(msg)
-            combined = f"{subject}\n{body}"
-
-            if not any(
-                k.lower() in combined.lower()
-                for k in OTP_KEYWORDS
-            ):
-                continue
-
-            code = extract_code(combined)
-            if code:
-                codes.append(code)
-
-        return codes
-
-    except Exception as exc:
-        print(f"Gmail error: {exc}", flush=True)
+    status, data = mail.uid("search", None, f"UID {gmail_uid_watermark + 1}:*")
+    if status != "OK":
         return []
-    finally:
-        if mail:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+
+    codes = []
+
+    for raw_uid in data[0].split():
+        uid = int(raw_uid)
+        if uid <= gmail_uid_watermark:
+            continue
+
+        # Advance the watermark for every new message, so each UID is handled once.
+        gmail_uid_watermark = max(gmail_uid_watermark, uid)
+
+        msg = fetch_uid(mail, uid)
+        if not msg:
+            continue
+
+        subject = decode_header_value(msg.get("Subject", ""))
+        body = get_text(msg)
+        combined = f"{subject}\n{body}"
+
+        if not any(k.lower() in combined.lower() for k in OTP_KEYWORDS):
+            continue
+
+        code = extract_code(combined)
+        if code:
+            codes.append(code)
+
+    return codes
 
 
-async def otp_worker(app):
+async def send_otp(code):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "📋 Copy",
+            copy_text={"text": code}
+        )
+    ]])
+
+    await application.bot.send_message(
+        chat_id=CHAT_ID,
+        text=f"Code: {code}",
+        reply_markup=keyboard
+    )
+
+
+def schedule_code(code):
+    if telegram_loop and not telegram_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(send_otp(code), telegram_loop)
+
+
+def imap_idle_worker():
+    """
+    Dedicated blocking thread for IMAP.
+    Telegram's asyncio loop is never blocked by Gmail.
+    Gmail IDLE wakes this thread when INBOX changes.
+    """
+    global gmail_uid_watermark
+
     while True:
+        mail = None
         try:
-            codes = await asyncio.to_thread(gmail_check_sync)
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
+            mail.login(GMAIL, APP_PASSWORD)
+            mail.select("INBOX", readonly=True)
 
-            for code in codes:
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "📋 Copy",
-                        copy_text={"text": code}
+            print("Gmail IMAP connected; waiting for new mail...", flush=True)
+
+            # Establish the watermark only on first startup.
+            if gmail_uid_watermark == 0:
+                status, data = mail.uid("search", None, "ALL")
+                if status == "OK" and data[0]:
+                    gmail_uid_watermark = int(data[0].split()[-1])
+                    print(
+                        f"Gmail startup watermark: {gmail_uid_watermark}",
+                        flush=True
                     )
-                ]])
 
-                await app.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"Code: {code}",
-                    reply_markup=keyboard
-                )
+            while True:
+                # First check for anything that arrived between IDLE cycles.
+                for code in process_new_uids(mail):
+                    schedule_code(code)
+
+                # Enter IMAP IDLE. This blocks ONLY this dedicated thread.
+                tag = mail._new_tag()
+                mail.send(tag + b" IDLE\r\n")
+
+                # Wait for Gmail to confirm IDLE.
+                response = mail.readline()
+                if not response:
+                    raise ConnectionError("IMAP IDLE connection closed")
+
+                # Gmail may keep IDLE open for about 29 minutes max.
+                # Use a 25-minute cycle so we can cleanly refresh it.
+                deadline = time.monotonic() + (25 * 60)
+
+                while time.monotonic() < deadline:
+                    mail.sock.settimeout(30)
+
+                    try:
+                        line = mail.readline()
+                    except TimeoutError:
+                        # Send a harmless NOOP while remaining in IDLE.
+                        continue
+
+                    if not line:
+                        raise ConnectionError("IMAP connection closed")
+
+                    # Any EXISTS/RECENT notification means the inbox changed.
+                    if b" EXISTS" in line or b" RECENT" in line:
+                        # Exit IDLE and fetch the new UID(s).
+                        try:
+                            mail.send(b"DONE\r\n")
+                            mail.readline()
+                        except Exception:
+                            pass
+
+                        # Tiny delay gives Gmail time to expose the new UID.
+                        time.sleep(0.15)
+
+                        for code in process_new_uids(mail):
+                            schedule_code(code)
+
+                        break
+
+                else:
+                    # Refresh IDLE before Gmail's timeout.
+                    try:
+                        mail.send(b"DONE\r\n")
+                        mail.readline()
+                    except Exception:
+                        pass
 
         except Exception as exc:
-            print(f"OTP worker error: {exc}", flush=True)
+            print(f"IMAP worker reconnecting: {exc}", flush=True)
+            time.sleep(1)
 
-        await asyncio.sleep(2)
+        finally:
+            if mail:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
 
 
 async def post_init(app):
-    global bot_started_at, uid_watermark
+    global bot_started_at, telegram_loop
 
-    # Drop old Telegram updates first.
+    # Discard Telegram updates queued before this process started.
     await app.bot.delete_webhook(drop_pending_updates=True)
 
-    # IMPORTANT: establish the Gmail UID baseline BEFORE starting the worker.
-    # Therefore all messages already in the inbox are ignored.
-    uid_watermark = await asyncio.to_thread(get_current_uid_watermark)
+    # Establish the Gmail baseline BEFORE starting the worker.
+    gmail_uid_watermark = get_startup_uid()
 
     bot_started_at = datetime.now(timezone.utc)
+    telegram_loop = asyncio.get_running_loop()
 
     print(
-        f"Bot ready. Gmail UID watermark={uid_watermark}. "
-        f"Telegram cutoff={bot_started_at.isoformat()}",
+        f"Bot ready. Gmail UID watermark={gmail_uid_watermark}",
         flush=True
     )
 
-    app.create_task(otp_worker(app))
+    # Dedicated Gmail thread: never blocks Telegram polling.
+    threading.Thread(
+        target=imap_idle_worker,
+        daemon=True,
+        name="gmail-imap-idle"
+    ).start()
 
 
 def main():
-    app = (
+    global application
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+    application.add_handler(
         CallbackQueryHandler(
             generate_variations_callback,
             pattern=r"^generate_variations$"
@@ -301,7 +373,7 @@ def main():
     )
 
     print("Telegram bot starting...", flush=True)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
