@@ -35,6 +35,7 @@ RE_OTP_KEYWORD = re.compile(
 RE_OTP_FALLBACK = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
 
 gmail_uid_watermark = 0
+watermark_lock = threading.Lock()
 bot_started_at = None
 telegram_loop = None
 application = None
@@ -112,7 +113,57 @@ async def generate_variations_callback(update: Update, context: ContextTypes.DEF
 
     await q.answer()
     lines = [f"`{v.replace('`', '')}`" for v in create_variations(BASE_TEXT, VARIATION_COUNT)]
-    await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    
+    # Button attached after variations are output
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⚡ Check OTP Now", callback_data="instant_check")
+    ]])
+
+    await q.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
+async def instant_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.message.chat_id != CHAT_ID:
+        await q.answer()
+        return
+
+    await q.answer("🔍 Checking inbox for new OTP...", show_alert=False)
+
+    # Perform quick synchronous check in thread
+    codes = await asyncio.to_thread(manual_inbox_check)
+
+    if codes:
+        for code in codes:
+            await send_telegram_code(code)
+    else:
+        await q.message.reply_text("❌ No new OTP codes found in inbox.")
+
+
+def manual_inbox_check():
+    """Quick one-shot IMAP fetch for manual button trigger."""
+    mail = None
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
+        mail.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        mail.login(GMAIL, APP_PASSWORD)
+        mail.select("INBOX", readonly=True)
+
+        with watermark_lock:
+            return fetch_and_process_new(mail)
+    except Exception as e:
+        print(f"Manual check error: {e}", flush=True)
+        return []
+    finally:
+        if mail:
+            try:
+                mail.logout()
+            except Exception:
+                pass
 
 
 def startup_uid():
@@ -165,23 +216,19 @@ def fetch_and_process_new(mail):
                 raw_header = item[1].decode("utf-8", errors="ignore")
                 subject = decode_header_value(raw_header)
                 
-                # Fast check in subject line
                 if any(k in subject.lower() for k in OTP_KEYWORDS):
                     code = extract_code(subject)
                     if code:
                         codes.append(code)
                         continue
                 
-                # If subject didn't yield a code, we flag this UID for body fetch
-                # Extract UID from the IMAP response tuple metadata string if possible, 
-                # or fallback to resolving via batch index.
                 match = re.search(r"UID\s+(\d+)", item[0].decode("utf-8", errors="ignore"))
                 if match:
                     unresolved_uids.append(match.group(1))
             except Exception:
                 continue
 
-    # STEP 2: Fetch Text body ONLY for emails where the subject wasn't enough
+    # STEP 2: Fetch Text body ONLY for emails where subject didn't contain code
     if unresolved_uids:
         body_batch_str = ",".join(unresolved_uids)
         status, body_data = mail.uid("fetch", body_batch_str, "(BODY.PEEK[TEXT])")
@@ -231,8 +278,9 @@ def gmail_idle_worker():
             print("Gmail IMAP connected (Max-Speed Mode) — IDLE active", flush=True)
 
             while True:
-                for code in fetch_and_process_new(mail):
-                    schedule_telegram_code(code)
+                with watermark_lock:
+                    for code in fetch_and_process_new(mail):
+                        schedule_telegram_code(code)
 
                 tag = mail._new_tag()
                 mail.send(tag + b" IDLE\r\n")
@@ -247,7 +295,6 @@ def gmail_idle_worker():
                     if hasattr(mail, '_file') and mail._file and mail._file.peek():
                         ready = True
                     else:
-                        # 2-second timeout for lightning-fast polling loop response
                         r, _, _ = select.select([mail.sock], [], [], 2.0)
                         ready = bool(r)
 
@@ -266,8 +313,9 @@ def gmail_idle_worker():
                             if not done_line or done_line.startswith(tag):
                                 break
 
-                        for code in fetch_and_process_new(mail):
-                            schedule_telegram_code(code)
+                        with watermark_lock:
+                            for code in fetch_and_process_new(mail):
+                                schedule_telegram_code(code)
 
                         break
 
@@ -323,6 +371,12 @@ def main():
         CallbackQueryHandler(
             generate_variations_callback,
             pattern=r"^generate_variations$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            instant_check_callback,
+            pattern=r"^instant_check$"
         )
     )
 
